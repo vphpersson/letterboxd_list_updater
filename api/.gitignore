@@ -6,5 +6,7 @@
 !/go.sum
 
 !/types
+!/utils
 
 !/types/**/*
+!/utils/**/*
