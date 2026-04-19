@@ -1,0 +1,10 @@
+*
+!/.gitignore
+!/api.go
+!/utils.go
+!/go.mod
+!/go.sum
+
+!/types
+
+!/types/**/*

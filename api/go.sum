@@ -1,0 +1,16 @@
+github.com/Motmedel/utils_go v0.0.466 h1:/720WVYWgxr35Madd2zTsT4Zz0riZh16tNR7VcNjM4Y=
+github.com/Motmedel/utils_go v0.0.466/go.mod h1:st9wrD7tyw4AM64tOD7rs0vO7tMxmXQC1Apm48B+4Q4=
+github.com/Motmedel/utils_go/pkg/http/mux v0.0.185 h1:TaIhaPHKr25VP3Lph73Jh3i7bFCVJkN1AzkHwj/yoRI=
+github.com/Motmedel/utils_go/pkg/http/mux v0.0.185/go.mod h1:DH2V1jr/cicQl31A5qkHLd8A/bYPpmWABtyQlnNtmoU=
+github.com/Motmedel/utils_go/pkg/http/mux/types/body_parser/json_schema_body_parser v0.0.21 h1:+3Vm5BFFYo1x+Eo0rlfkD6ie9EmXns06xGuXVpmK3QQ=
+github.com/Motmedel/utils_go/pkg/http/mux/types/body_parser/json_schema_body_parser v0.0.21/go.mod h1:loQGq0ylQFvdQV7JVDClw45JE+W45jZbQKE8PfP7K9M=
+github.com/altshiftab/jsonschema v0.0.15 h1:19JhSF2SpAuJBEl+lhL5RN06Us5vbi1OlPkAUvGvJqU=
+github.com/altshiftab/jsonschema v0.0.15/go.mod h1:iqYu4Yj2ZpzqOJ29pHMUQoP/NiT58IXV03y2TfZ2YKc=
+github.com/vphpersson/type_generation v0.0.25 h1:jsl9Lt71HO1THmGOEO9la/RipM9k3tcY0eCt7mQScx0=
+github.com/vphpersson/type_generation v0.0.25/go.mod h1:06Pgo2YKw6r+SzFIepdiiEZ93J2VJDYIC5Ci9Av+cPE=
+golang.org/x/net v0.49.0 h1:eeHFmOGUTtaaPSGNmjBKpbng9MulQsJURQUAfUwY++o=
+golang.org/x/net v0.49.0/go.mod h1:/ysNB2EvaqvesRkuLAyjI1ycPZlQHM3q01F02UY/MV8=
+golang.org/x/sync v0.19.0 h1:vV+1eWNmZ5geRlYjzm2adRgW2/mcpevXNg50YZtPCE4=
+golang.org/x/sync v0.19.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=
+golang.org/x/text v0.33.0 h1:B3njUFyqtHDUI5jMn1YIr5B0IE2U0qck04r6d4KPAxE=
+golang.org/x/text v0.33.0/go.mod h1:LuMebE6+rBincTi9+xWTY8TztLzKHc/9C1uBCG27+q8=
