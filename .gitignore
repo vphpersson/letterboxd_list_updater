@@ -1,5 +1,12 @@
 *
+!/.dockerignore
 !/.gitignore
+!/Dockerfile
+!/go.mod
+!/go.sum
+!/Makefile
+!/service.go
 
 !/api
-!/backend
+
+!/api/*/**
