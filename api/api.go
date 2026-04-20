@@ -32,7 +32,6 @@ type Options struct {
 	Username   string
 	Password   string
 	CookiePath string
-	DumpDir    string
 }
 
 type Client struct {
@@ -40,7 +39,6 @@ type Client struct {
 	username   string
 	password   string
 	cookiePath string
-	dumpDir    string
 
 	mu       sync.Mutex
 	loggedIn bool
@@ -59,7 +57,6 @@ func NewClient(opts Options) (*Client, error) {
 		username:   opts.Username,
 		password:   opts.Password,
 		cookiePath: opts.CookiePath,
-		dumpDir:    opts.DumpDir,
 	}
 	if c.cookiePath != "" {
 		if err := c.loadCookies(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -264,7 +261,6 @@ func (c *Client) parseListInfo(user, slug string, body []byte) (*listInfo, error
 		info.CSRF = c.csrf()
 	}
 	if info.ListLid == "" {
-		c.dumpHTML("edit-page", body)
 		return nil, errors.New("filmListLid not found in edit page")
 	}
 	return info, nil
@@ -314,7 +310,6 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 
 	dataJSONMatches := reImportFilmDataJSON.FindAllStringSubmatch(string(importBody), -1)
 	if len(dataJSONMatches) == 0 {
-		c.dumpHTML("import-response", importBody)
 		return nil, errors.New("no import-film nodes in /import/list/ response")
 	}
 	filmObjects := make([]string, 0, len(dataJSONMatches))
@@ -344,7 +339,6 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 
 	numericMatches := reImportFilmIDNum.FindAllStringSubmatch(string(matchBodyBytes), -1)
 	if len(numericMatches) == 0 {
-		c.dumpHTML("match-response", matchBodyBytes)
 		return nil, errors.New("no numeric film ids in match response")
 	}
 	type stagedEntry struct {
@@ -450,7 +444,7 @@ func (c *Client) patchList(ctx context.Context, info *listInfo, filmLIDs []strin
 		return fmt.Errorf("marshal body: %w", err)
 	}
 
-	resp, respBody, err := c.fetch(ctx, http.MethodPatch,
+	resp, _, err := c.fetch(ctx, http.MethodPatch,
 		fmt.Sprintf("%s/api/v0/list/%s", BaseURL, info.ListLid),
 		payload,
 		map[string]string{
@@ -460,7 +454,6 @@ func (c *Client) patchList(ctx context.Context, info *listInfo, filmLIDs []strin
 		},
 	)
 	if err != nil {
-		c.dumpHTML("patch-response", respBody)
 		return fmt.Errorf("patch: %w", err)
 	}
 	slog.InfoContext(ctx, "PATCH /api/v0/list ok",
@@ -493,18 +486,6 @@ func (c *Client) loadCookies() error {
 	u, _ := url.Parse(BaseURL)
 	c.http.Jar.SetCookies(u, cookies)
 	return nil
-}
-
-func (c *Client) dumpHTML(tag string, body []byte) {
-	if c.dumpDir == "" {
-		return
-	}
-	path := fmt.Sprintf("%s/letterboxd_%s.html", strings.TrimRight(c.dumpDir, "/"), tag)
-	if err := os.WriteFile(path, body, 0600); err != nil {
-		slog.Warn("dumpHTML: write failed", "path", path, "err", err)
-		return
-	}
-	slog.Info("dumpHTML: wrote", "path", path, "bytes", len(body))
 }
 
 func parseListURL(raw string) (user, slug string, err error) {
