@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
@@ -18,6 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/Motmedel/utils_go/pkg/http/types/fetch_config"
+	httpUtils "github.com/Motmedel/utils_go/pkg/http/utils"
 )
 
 const (
@@ -111,14 +113,26 @@ func (c *Client) UpdateList(ctx context.Context, listURL string, csv []byte) err
 	return nil
 }
 
-func (c *Client) do(req *http.Request) (*http.Response, error) {
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", userAgent)
+func (c *Client) fetch(
+	ctx context.Context,
+	method, url string,
+	body []byte,
+	headers map[string]string,
+) (*http.Response, []byte, error) {
+	merged := map[string]string{
+		"User-Agent":      userAgent,
+		"Accept-Language": "en-US,en;q=0.9",
 	}
-	if req.Header.Get("Accept-Language") == "" {
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	for k, v := range headers {
+		merged[k] = v
 	}
-	return c.http.Do(req)
+	return httpUtils.Fetch(ctx, url,
+		fetch_config.WithMethod(method),
+		fetch_config.WithBody(body),
+		fetch_config.WithHeaders(merged),
+		fetch_config.WithHttpClient(c.http),
+		fetch_config.WithSkipErrorOnStatus(true),
+	)
 }
 
 func (c *Client) csrf() string {
@@ -156,13 +170,9 @@ func (c *Client) ensureLogin(ctx context.Context) error {
 }
 
 func (c *Client) login(ctx context.Context) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, BaseURL+"/", nil)
-	resp, err := c.do(req)
-	if err != nil {
+	if _, _, err := c.fetch(ctx, http.MethodGet, BaseURL+"/", nil, nil); err != nil {
 		return fmt.Errorf("prime: %w", err)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
 
 	csrf := c.csrf()
 	if csrf == "" {
@@ -174,18 +184,16 @@ func (c *Client) login(ctx context.Context) error {
 		"username": {c.username},
 		"password": {c.password},
 	}
-	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+"/user/login.do", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Referer", BaseURL+"/")
-	resp, err = c.do(req)
+	resp, body, err := c.fetch(ctx, http.MethodPost, BaseURL+"/user/login.do",
+		[]byte(form.Encode()),
+		map[string]string{
+			"Content-Type":     "application/x-www-form-urlencoded",
+			"X-Requested-With": "XMLHttpRequest",
+			"Referer":          BaseURL + "/",
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("login post: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read login body: %w", err)
 	}
 	if !bytes.Contains(body, []byte(`"result": "success"`)) && !bytes.Contains(body, []byte(`"result":"success"`)) {
 		return fmt.Errorf("login failed (status %d): %s", resp.StatusCode, truncate(string(body), 200))
@@ -210,18 +218,12 @@ type listInfo struct {
 
 func (c *Client) getListInfo(ctx context.Context, user, slug string) (*listInfo, error) {
 	u := fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, user, slug)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	resp, err := c.do(req)
+	resp, body, err := c.fetch(ctx, http.MethodGet, u, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get edit: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("get edit: status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read edit body: %w", err)
 	}
 	return c.parseListInfo(user, slug, body)
 }
@@ -292,20 +294,18 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 		return nil, fmt.Errorf("close multipart: %w", err)
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+"/import/list/", &buf)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Referer", fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, info.User, info.Slug))
-	resp, err := c.do(req)
+	importResp, importBody, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/list/",
+		buf.Bytes(),
+		map[string]string{
+			"Content-Type": mw.FormDataContentType(),
+			"Referer":      fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, info.User, info.Slug),
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("post import: %w", err)
 	}
-	importBody, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("read import body: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("import: status %d", resp.StatusCode)
+	if importResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("import: status %d", importResp.StatusCode)
 	}
 
 	dataJSONMatches := reImportFilmDataJSON.FindAllStringSubmatch(string(importBody), -1)
@@ -325,22 +325,20 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 		"json":   {matchPayload},
 		"__csrf": {info.CSRF},
 	}
-	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+"/import/watchlist/match-import-film/", strings.NewReader(matchForm.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("Accept", "text/html, */*; q=0.01")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Referer", BaseURL+"/import/list/")
-	resp, err = c.do(req)
+	matchResp, matchBodyBytes, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/watchlist/match-import-film/",
+		[]byte(matchForm.Encode()),
+		map[string]string{
+			"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+			"Accept":           "text/html, */*; q=0.01",
+			"X-Requested-With": "XMLHttpRequest",
+			"Referer":          BaseURL + "/import/list/",
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("post match-import-film: %w", err)
 	}
-	matchBodyBytes, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("read match body: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("match-import-film: status %d", resp.StatusCode)
+	if matchResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("match-import-film: status %d", matchResp.StatusCode)
 	}
 
 	numericMatches := reImportFilmIDNum.FindAllStringSubmatch(string(matchBodyBytes), -1)
@@ -375,20 +373,18 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 		"cancelled":         {"false"},
 		"entries":           {string(entriesJSON)},
 	}
-	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+"/list/add-films/", strings.NewReader(stageForm.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", BaseURL+"/import/list/")
-	resp, err = c.do(req)
+	stageResp, body, err := c.fetch(ctx, http.MethodPost, BaseURL+"/list/add-films/",
+		[]byte(stageForm.Encode()),
+		map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded",
+			"Referer":      BaseURL + "/import/list/",
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("post add-films: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("add-films: status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read add-films body: %w", err)
+	if stageResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("add-films: status %d", stageResp.StatusCode)
 	}
 
 	// Refresh list metadata (version, csrf) — the staging form bumps the
@@ -456,19 +452,18 @@ func (c *Client) patchList(ctx context.Context, info *listInfo, filmLIDs []strin
 		return fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPatch,
+	resp, respBody, err := c.fetch(ctx, http.MethodPatch,
 		fmt.Sprintf("%s/api/v0/list/%s", BaseURL, info.ListLid),
-		bytes.NewReader(payload),
+		payload,
+		map[string]string{
+			"Content-Type": "application/json; charset=UTF-8",
+			"X-Csrf-Token": info.CSRF,
+			"Referer":      fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, info.User, info.Slug),
+		},
 	)
-	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	req.Header.Set("X-Csrf-Token", info.CSRF)
-	req.Header.Set("Referer", fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, info.User, info.Slug))
-	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("patch: %w", err)
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
 		c.dumpHTML("patch-response", respBody)
 		return fmt.Errorf("patch: status %d: %s", resp.StatusCode, truncate(string(respBody), 400))
