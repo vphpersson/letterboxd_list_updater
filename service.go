@@ -23,14 +23,12 @@ func main() {
 	username := motmedelEnv.ReadEnvFatal("LETTERBOXD_USERNAME")
 	password := motmedelEnv.ReadEnvFatal("LETTERBOXD_PASSWORD")
 	cookiePath := motmedelEnv.GetEnvWithDefault("LETTERBOXD_COOKIE_PATH", "")
-	dumpDir := motmedelEnv.GetEnvWithDefault("LETTERBOXD_DUMP_DIR", "/tmp")
 
 	client, err := api.NewClient(
 		api.Options{
 			Username:   username,
 			Password:   password,
 			CookiePath: cookiePath,
-			DumpDir:    dumpDir,
 		},
 	)
 	if err != nil {
