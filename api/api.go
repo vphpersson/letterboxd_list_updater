@@ -118,6 +118,7 @@ func (c *Client) fetch(
 	method, url string,
 	body []byte,
 	headers map[string]string,
+	opts ...fetch_config.Option,
 ) (*http.Response, []byte, error) {
 	merged := map[string]string{
 		"User-Agent":      userAgent,
@@ -126,13 +127,13 @@ func (c *Client) fetch(
 	for k, v := range headers {
 		merged[k] = v
 	}
-	return httpUtils.Fetch(ctx, url,
+	base := []fetch_config.Option{
 		fetch_config.WithMethod(method),
 		fetch_config.WithBody(body),
 		fetch_config.WithHeaders(merged),
 		fetch_config.WithHttpClient(c.http),
-		fetch_config.WithSkipErrorOnStatus(true),
-	)
+	}
+	return httpUtils.Fetch(ctx, url, append(base, opts...)...)
 }
 
 func (c *Client) csrf() string {
@@ -191,6 +192,7 @@ func (c *Client) login(ctx context.Context) error {
 			"X-Requested-With": "XMLHttpRequest",
 			"Referer":          BaseURL + "/",
 		},
+		fetch_config.WithSkipErrorOnStatus(true),
 	)
 	if err != nil {
 		return fmt.Errorf("login post: %w", err)
@@ -218,12 +220,9 @@ type listInfo struct {
 
 func (c *Client) getListInfo(ctx context.Context, user, slug string) (*listInfo, error) {
 	u := fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, user, slug)
-	resp, body, err := c.fetch(ctx, http.MethodGet, u, nil, nil)
+	_, body, err := c.fetch(ctx, http.MethodGet, u, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get edit: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("get edit: status %d", resp.StatusCode)
 	}
 	return c.parseListInfo(user, slug, body)
 }
@@ -294,7 +293,7 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 		return nil, fmt.Errorf("close multipart: %w", err)
 	}
 
-	importResp, importBody, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/list/",
+	_, importBody, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/list/",
 		buf.Bytes(),
 		map[string]string{
 			"Content-Type": mw.FormDataContentType(),
@@ -303,9 +302,6 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 	)
 	if err != nil {
 		return nil, fmt.Errorf("post import: %w", err)
-	}
-	if importResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("import: status %d", importResp.StatusCode)
 	}
 
 	dataJSONMatches := reImportFilmDataJSON.FindAllStringSubmatch(string(importBody), -1)
@@ -325,7 +321,7 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 		"json":   {matchPayload},
 		"__csrf": {info.CSRF},
 	}
-	matchResp, matchBodyBytes, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/watchlist/match-import-film/",
+	_, matchBodyBytes, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/watchlist/match-import-film/",
 		[]byte(matchForm.Encode()),
 		map[string]string{
 			"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
@@ -336,9 +332,6 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 	)
 	if err != nil {
 		return nil, fmt.Errorf("post match-import-film: %w", err)
-	}
-	if matchResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("match-import-film: status %d", matchResp.StatusCode)
 	}
 
 	numericMatches := reImportFilmIDNum.FindAllStringSubmatch(string(matchBodyBytes), -1)
@@ -373,7 +366,7 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 		"cancelled":         {"false"},
 		"entries":           {string(entriesJSON)},
 	}
-	stageResp, body, err := c.fetch(ctx, http.MethodPost, BaseURL+"/list/add-films/",
+	_, body, err := c.fetch(ctx, http.MethodPost, BaseURL+"/list/add-films/",
 		[]byte(stageForm.Encode()),
 		map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -382,9 +375,6 @@ func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]
 	)
 	if err != nil {
 		return nil, fmt.Errorf("post add-films: %w", err)
-	}
-	if stageResp.StatusCode >= 400 {
-		return nil, fmt.Errorf("add-films: status %d", stageResp.StatusCode)
 	}
 
 	// Refresh list metadata (version, csrf) — the staging form bumps the
@@ -462,11 +452,8 @@ func (c *Client) patchList(ctx context.Context, info *listInfo, filmLIDs []strin
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("patch: %w", err)
-	}
-	if resp.StatusCode >= 400 {
 		c.dumpHTML("patch-response", respBody)
-		return fmt.Errorf("patch: status %d: %s", resp.StatusCode, truncate(string(respBody), 400))
+		return fmt.Errorf("patch: %w", err)
 	}
 	slog.InfoContext(ctx, "PATCH /api/v0/list ok",
 		"status", resp.StatusCode, "lid", info.ListLid, "version", info.Version, "entries", len(entries))
