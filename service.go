@@ -10,13 +10,12 @@ import (
 	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
 	"github.com/Motmedel/utils_go/pkg/utils"
 	gcpUtilsLogger "github.com/altshiftab/gcp_utils/pkg/types/logger"
-	"github.com/altshiftab/gcp_utils/pkg/types/logger/logger_config"
 	"github.com/vphpersson/letterboxd_list_updater/api"
 	letterboxdEndpoint "github.com/vphpersson/letterboxd_list_updater/api/types/endpoint"
 )
 
 func main() {
-	logger := gcpUtilsLogger.New(logger_config.WithLogLevel(slog.LevelDebug))
+	logger := gcpUtilsLogger.New()
 	slog.SetDefault(logger.Logger)
 
 	port := motmedelEnv.GetEnvWithDefault("PORT", "8080")
