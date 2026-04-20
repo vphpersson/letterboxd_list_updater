@@ -7,6 +7,8 @@
 
 !/types
 !/utils
+!/letterboxd
 
 !/types/**/*
 !/utils/**/*
+!/letterboxd/**/*

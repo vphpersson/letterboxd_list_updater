@@ -5,6 +5,13 @@ type UpdateList struct {
 	Data string `json:"data" jsonschema:"data"`
 }
 
+// ParsedUpdate is the stored form of UpdateList after the body processor
+// has parsed Data into ImportEntry rows and validated the Review format.
+type ParsedUpdate struct {
+	List    string
+	Entries []*ImportEntry
+}
+
 // ImportEntry is a single row in the Letterboxd import CSV format.
 // At least one of LetterboxdURI, TmdbID, ImdbID, Title must be set.
 // Review doubles as the Notes field when importing to a list.
