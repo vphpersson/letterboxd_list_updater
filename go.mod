@@ -6,7 +6,7 @@ require (
 	github.com/Motmedel/utils_go v0.0.467
 	github.com/Motmedel/utils_go/pkg/http/mux v0.0.185
 	github.com/altshiftab/gcp_utils v0.0.22
-	github.com/vphpersson/letterboxd_list_updater/api v0.0.6
+	github.com/vphpersson/letterboxd_list_updater/api v0.0.7
 )
 
 require (
