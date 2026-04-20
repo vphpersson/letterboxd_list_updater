@@ -21,7 +21,7 @@ import (
 	"github.com/Motmedel/utils_go/pkg/http/types/problem_detail"
 	"github.com/Motmedel/utils_go/pkg/http/types/problem_detail/problem_detail_config"
 	motmedelReflect "github.com/Motmedel/utils_go/pkg/reflect"
-	"github.com/vphpersson/letterboxd_list_updater/api/letterboxd"
+	"github.com/vphpersson/letterboxd_list_updater/api"
 	"github.com/vphpersson/letterboxd_list_updater/api/types"
 	"github.com/vphpersson/letterboxd_list_updater/api/utils"
 )
@@ -49,7 +49,7 @@ func parseAndValidate(_ context.Context, input *BodyInput) (Stored, *response_er
 	return &types.ParsedUpdate{List: input.List, Entries: entries}, nil
 }
 
-func (e *Endpoint) Initialize(client *letterboxd.Client) error {
+func (e *Endpoint) Initialize(client *api.Client) error {
 	if client == nil {
 		return motmedelErrors.NewWithTrace(nil_error.New("letterboxd client"))
 	}
@@ -71,7 +71,7 @@ func (e *Endpoint) Initialize(client *letterboxd.Client) error {
 				),
 			}
 		}
-		listURL := letterboxd.BaseURL + "/" + strings.Replace(listPath, "/", "/list/", 1)
+		listURL := api.BaseURL + "/" + strings.Replace(listPath, "/", "/list/", 1)
 
 		csv := utils.ImportEntriesToCSV(parsed.Entries)
 
