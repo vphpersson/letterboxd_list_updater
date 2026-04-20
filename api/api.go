@@ -228,7 +228,15 @@ func (c *Client) getListInfo(ctx context.Context, user, slug string) (*listInfo,
 }
 
 func (c *Client) parseListInfo(user, slug string, body []byte) (*listInfo, error) {
-	src := string(body)
+	full := string(body)
+	// The page ships several unrelated forms (sign-in modal, add-film popup,
+	// etc.) whose own __csrf inputs carry the literal "placeholder" until JS
+	// swaps them in. Scope all lookups to the list edit form so we pick the
+	// real values.
+	src := extractFormByID(full, "list-form")
+	if src == "" {
+		src = full
+	}
 	info := &listInfo{
 		User:        user,
 		Slug:        slug,
@@ -509,6 +517,17 @@ func parseListURL(raw string) (user, slug string, err error) {
 		return "", "", fmt.Errorf("expected /<user>/list/<slug>, got %q", u.Path)
 	}
 	return parts[0], parts[2], nil
+}
+
+// extractFormByID returns the inner contents of <form id="<id>">...</form>.
+// Empty if not found or the form is unterminated.
+func extractFormByID(src, id string) string {
+	q := regexp.QuoteMeta(id)
+	re := regexp.MustCompile(`(?s)<form\b[^>]*\bid="` + q + `"[^>]*>(.*?)</form>`)
+	if m := re.FindStringSubmatch(src); len(m) > 1 {
+		return m[1]
+	}
+	return ""
 }
 
 // findInputValue locates the `value` of an <input> whose `name` matches the
