@@ -28,6 +28,12 @@ const (
 	userAgent      = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
+// errSessionExpired is returned by the pre-mutation fetch when Letterboxd
+// responds with 403 — typically Cloudflare serving a managed challenge
+// because the cached session cookie has gone stale server-side. UpdateList
+// catches this, drops the jar, re-logs in, and retries once.
+var errSessionExpired = errors.New("letterboxd: session expired (403)")
+
 type Options struct {
 	Username   string
 	Password   string
@@ -71,7 +77,7 @@ func NewClient(opts Options) (*Client, error) {
 
 func (c *Client) Close() {}
 
-// UpdateList logs in (once per process) then walks the full import flow:
+// UpdateList logs in (lazily, once) then walks the full import flow:
 //
 //  1. GET the list's edit page to capture list metadata (list LID, version,
 //     name, sharing policy, ranked, description, tags, CSRF).
@@ -81,7 +87,23 @@ func (c *Client) Close() {}
 //  4. PATCH /api/v0/list/<list_lid> (JSON, X-Csrf-Token header) to commit.
 //
 // No notes are written (step 4 leaves entries without review).
+//
+// If the first (read-only) hop returns 403 — typically a Cloudflare challenge
+// triggered by a server-side-expired session cookie — the session is dropped
+// and the whole flow is retried once after a fresh login. The retry is
+// deliberately scoped to the pre-mutation step so a mid-flight 403 can't
+// cause films to be staged twice.
 func (c *Client) UpdateList(ctx context.Context, listURL string, csv []byte) error {
+	err := c.updateListOnce(ctx, listURL, csv)
+	if errors.Is(err, errSessionExpired) {
+		slog.InfoContext(ctx, "Letterboxd session appears expired; re-logging in and retrying once.")
+		c.invalidateSession()
+		return c.updateListOnce(ctx, listURL, csv)
+	}
+	return err
+}
+
+func (c *Client) updateListOnce(ctx context.Context, listURL string, csv []byte) error {
 	if err := c.ensureLogin(ctx); err != nil {
 		return err
 	}
@@ -167,6 +189,17 @@ func (c *Client) ensureLogin(ctx context.Context) error {
 	return nil
 }
 
+// invalidateSession clears the cached login flag and drops all cookies so a
+// stale session cookie can't leak into the re-login attempt.
+func (c *Client) invalidateSession() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loggedIn = false
+	if jar, err := cookiejar.New(nil); err == nil {
+		c.http.Jar = jar
+	}
+}
+
 func (c *Client) login(ctx context.Context) error {
 	if _, _, err := c.fetch(ctx, http.MethodGet, BaseURL+"/", nil, nil); err != nil {
 		return fmt.Errorf("prime: %w", err)
@@ -217,9 +250,17 @@ type listInfo struct {
 
 func (c *Client) getListInfo(ctx context.Context, user, slug string) (*listInfo, error) {
 	u := fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, user, slug)
-	_, body, err := c.fetch(ctx, http.MethodGet, u, nil, nil)
+	resp, body, err := c.fetch(ctx, http.MethodGet, u, nil, nil,
+		fetch_config.WithSkipErrorOnStatus(true),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("get edit: %w", err)
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, errSessionExpired
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get edit: status %d", resp.StatusCode)
 	}
 	return c.parseListInfo(user, slug, body)
 }
