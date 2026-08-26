@@ -1,6 +1,6 @@
 module github.com/vphpersson/letterboxd_list_updater/api
 
-go 1.26
+go 1.27
 
 require (
 	github.com/Motmedel/utils_go v0.0.466

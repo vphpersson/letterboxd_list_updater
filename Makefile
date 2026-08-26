@@ -2,7 +2,6 @@ CMD_BINARY     := letterboxd_list_updater
 SERVICE_BINARY := letterboxd_list_updater_service
 IMAGE          := letterboxd_list_updater
 REGISTRY       := registry.home.arpa
-GO_ENV         := GOEXPERIMENT=jsonv2
 
 .PHONY: all update build build-cmd build-service test fmt vet image publish clean
 
@@ -14,16 +13,16 @@ update:
 
 
 build:
-	$(GO_ENV) CGO_ENABLED=0 go build -ldflags="-s -w" -o $(SERVICE_BINARY) .
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o $(SERVICE_BINARY) .
 
 test:
-	$(GO_ENV) go test ./...
+	go test ./...
 
 fmt:
 	gofmt -w .
 
 vet:
-	$(GO_ENV) go vet ./...
+	go vet ./...
 
 image:
 	podman build -t $(IMAGE) .
