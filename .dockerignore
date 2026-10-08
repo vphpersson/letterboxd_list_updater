@@ -2,3 +2,6 @@
 !*.go
 !go.mod
 !go.sum
+!api
+!api/**
+!entrypoint.sh

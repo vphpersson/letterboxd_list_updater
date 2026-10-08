@@ -1,7 +1,9 @@
 *
 !/.gitignore
 !/api.go
-!/utils.go
+!/browser.go
+!/html.go
+!/*_test.go
 !/go.mod
 !/go.sum
 

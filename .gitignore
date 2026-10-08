@@ -6,6 +6,8 @@
 !/go.sum
 !/Makefile
 !/service.go
+!/service_test.go
+!/entrypoint.sh
 
 !/api
 

@@ -1,615 +1,705 @@
+// Package api adds films to a Letterboxd list the way the site's own importer
+// does, from inside a real Chrome.
+//
+// Letterboxd sits behind Cloudflare bot management that scores every request,
+// not only the first: a clearance earned by a browser does not carry a Go or
+// curl client through (measured 2026-10-08). So every request is made by the
+// browser itself, as an in-page fetch from a letterboxd.com page, and Go only
+// orchestrates and reads the answers.
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"log/slog"
-	"mime/multipart"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
-	"os"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/Motmedel/utils_go/pkg/http/types/fetch_config"
-	httpUtils "github.com/Motmedel/utils_go/pkg/http/utils"
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
+	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
+	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
+	"github.com/vphpersson/letterboxd_list_updater/api/types"
 )
 
 const (
-	BaseURL        = "https://letterboxd.com"
-	csrfCookieName = "com.xk72.webparts.csrf"
-	userAgent      = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+	BaseUrl = "https://letterboxd.com"
+
+	// maxExcerptBytes is how much of an unexpected page an error carries.
+	maxExcerptBytes = 300
+
+	// sharingPublic is the editor's sharing option for a published list.
+	sharingPublic = "Public"
+
+	headerContentType = "Content-Type"
+
+	// The paths the site has used, for when a page stops naming them.
+	defaultImportPath = "/import/list/"
+	defaultMatchPath  = "/import/watchlist/match-import-film/"
+	defaultStagePath  = "/list/add-films/"
 )
 
-// errSessionExpired is returned by the pre-mutation fetch when Letterboxd
-// responds with 403 — typically Cloudflare serving a managed challenge
-// because the cached session cookie has gone stale server-side. UpdateList
-// catches this, drops the jar, re-logs in, and retries once.
-var errSessionExpired = errors.New("letterboxd: session expired (403)")
+var (
+	// ErrNotSignedIn is the site answering as it does a visitor with no session.
+	ErrNotSignedIn = errors.New("not signed in")
+	// ErrChallenged is Cloudflare answering instead of the site.
+	ErrChallenged = errors.New("cloudflare challenge")
+	// ErrUnexpectedStatus is the site refusing or failing a request.
+	ErrUnexpectedStatus = errors.New("unexpected status")
+	// ErrUnexpectedPage is a page without what the import needs from it, which
+	// is what a change on Letterboxd's side looks like.
+	ErrUnexpectedPage = errors.New("unexpected page")
+	ErrBadListPath    = errors.New("bad list path")
+	// ErrSaveRefused is the API answering a save with an error message.
+	ErrSaveRefused = errors.New("save refused")
+	// ErrBusy is an update asked for while another is running.
+	ErrBusy = errors.New("an update is running")
+)
+
+// FormField is one field of a multipart form; one with a filename is a file.
+type FormField struct {
+	Name     string `json:"name"`
+	Value    string `json:"value"`
+	Filename string `json:"filename,omitzero"`
+	Type     string `json:"type,omitzero"`
+}
+
+// FetchRequest is a request for the page to make with fetch.
+type FetchRequest struct {
+	Method  string            `json:"method"`
+	Url     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitzero"`
+	Body    string            `json:"body,omitzero"`
+	// Multipart is sent as FormData, the browser choosing the boundary.
+	Multipart []*FormField `json:"multipart,omitzero"`
+}
+
+// FetchResponse is what the page's fetch came back with.
+type FetchResponse struct {
+	Status     int    `json:"status"`
+	Url        string `json:"url"`
+	Redirected bool   `json:"redirected"`
+	// Mitigated is Cloudflare's cf-mitigated header: "challenge" when it, not
+	// the site, answered.
+	Mitigated string `json:"mitigated"`
+	Body      string `json:"body"`
+}
+
+type pageFetcher interface {
+	Fetch(ctx context.Context, request *FetchRequest) (*FetchResponse, error)
+}
+
+// browserSession is a Chrome with a page on the site.
+type browserSession interface {
+	pageFetcher
+	// Open navigates the page and waits out any challenge in front of it.
+	Open(ctx context.Context, pageUrl string) error
+	SignedIn(ctx context.Context) (bool, error)
+	SignIn(ctx context.Context, username string, password string) error
+	Close(ctx context.Context)
+}
 
 type Options struct {
-	Username   string
-	Password   string
-	CookiePath string
+	Username string
+	Password string
+	// ChromePath is the Chrome binary; empty means google-chrome-stable.
+	ChromePath string
+	// ProfileDirectory keeps Chrome's profile, and with it the session,
+	// between updates. Empty means a profile of its own for every update,
+	// which signs in every time.
+	ProfileDirectory string
 }
 
 type Client struct {
-	http       *http.Client
-	username   string
-	password   string
-	cookiePath string
+	username string
+	password string
 
-	mu       sync.Mutex
-	loggedIn bool
+	// mutex keeps updates, and so Chromes on the one profile, to one at a time.
+	mutex sync.Mutex
+	// openSession starts a browser; a launched Chrome outside tests.
+	openSession func(ctx context.Context) (browserSession, error)
 }
 
-func NewClient(opts Options) (*Client, error) {
-	if opts.Username == "" || opts.Password == "" {
-		return nil, errors.New("letterboxd: username and password are required")
+func NewClient(options *Options) (*Client, error) {
+	if options == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("options"))
 	}
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("cookiejar new: %w", err)
+	if options.Username == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("username"))
 	}
-	c := &Client{
-		http:       &http.Client{Jar: jar},
-		username:   opts.Username,
-		password:   opts.Password,
-		cookiePath: opts.CookiePath,
-	}
-	if c.cookiePath != "" {
-		if err := c.loadCookies(); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("load cookies: %w", err)
-		}
-		if c.hasSessionCookie() {
-			c.loggedIn = true
-		}
-	}
-	return c, nil
-}
-
-func (c *Client) Close() {}
-
-// UpdateList logs in (lazily, once) then walks the full import flow:
-//
-//  1. GET the list's edit page to capture list metadata (list LID, version,
-//     name, sharing policy, ranked, description, tags, CSRF).
-//  2. POST the CSV to /import/list/ (multipart).
-//  3. POST /list/add-films/ — the response embeds the staged films with
-//     their Letterboxd short IDs (LIDs) on .js-new-film-list-entry nodes.
-//  4. PATCH /api/v0/list/<list_lid> (JSON, X-Csrf-Token header) to commit.
-//
-// No notes are written (step 4 leaves entries without review).
-//
-// If the first (read-only) hop returns 403 — typically a Cloudflare challenge
-// triggered by a server-side-expired session cookie — the session is dropped
-// and the whole flow is retried once after a fresh login. The retry is
-// deliberately scoped to the pre-mutation step so a mid-flight 403 can't
-// cause films to be staged twice.
-func (c *Client) UpdateList(ctx context.Context, listURL string, csv []byte) error {
-	err := c.updateListOnce(ctx, listURL, csv)
-	if errors.Is(err, errSessionExpired) {
-		slog.InfoContext(ctx, "Letterboxd session appears expired; re-logging in and retrying once.")
-		c.invalidateSession()
-		return c.updateListOnce(ctx, listURL, csv)
-	}
-	return err
-}
-
-func (c *Client) updateListOnce(ctx context.Context, listURL string, csv []byte) error {
-	if err := c.ensureLogin(ctx); err != nil {
-		return err
-	}
-	user, slug, err := parseListURL(listURL)
-	if err != nil {
-		return fmt.Errorf("parse list url: %w", err)
-	}
-	info, err := c.getListInfo(ctx, user, slug)
-	if err != nil {
-		return fmt.Errorf("get list info: %w", err)
-	}
-	filmLIDs, err := c.stageFilms(ctx, info, csv)
-	if err != nil {
-		return fmt.Errorf("stage films: %w", err)
-	}
-	if len(filmLIDs) == 0 {
-		slog.InfoContext(ctx, "Letterboxd list unchanged (all films already present).", "list", user+"/"+slug)
-		_ = c.saveCookies()
-		return nil
-	}
-	if err := c.patchList(ctx, info, filmLIDs); err != nil {
-		return fmt.Errorf("patch list: %w", err)
-	}
-	slog.InfoContext(ctx, "Letterboxd list updated.", "list", user+"/"+slug, "filmCount", len(filmLIDs))
-	_ = c.saveCookies()
-	return nil
-}
-
-func (c *Client) fetch(
-	ctx context.Context,
-	method, url string,
-	body []byte,
-	headers map[string]string,
-	opts ...fetch_config.Option,
-) (*http.Response, []byte, error) {
-	merged := map[string]string{
-		"User-Agent":      userAgent,
-		"Accept-Language": "en-US,en;q=0.9",
-	}
-	for k, v := range headers {
-		merged[k] = v
-	}
-	base := []fetch_config.Option{
-		fetch_config.WithMethod(method),
-		fetch_config.WithBody(body),
-		fetch_config.WithHeaders(merged),
-		fetch_config.WithHttpClient(c.http),
-	}
-	return httpUtils.Fetch(ctx, url, append(base, opts...)...)
-}
-
-func (c *Client) csrf() string {
-	u, _ := url.Parse(BaseURL)
-	for _, ck := range c.http.Jar.Cookies(u) {
-		if ck.Name == csrfCookieName {
-			return ck.Value
-		}
-	}
-	return ""
-}
-
-func (c *Client) hasSessionCookie() bool {
-	u, _ := url.Parse(BaseURL)
-	for _, ck := range c.http.Jar.Cookies(u) {
-		if ck.Name != csrfCookieName {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Client) ensureLogin(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.loggedIn {
-		return nil
-	}
-	if err := c.login(ctx); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
-	c.loggedIn = true
-	_ = c.saveCookies()
-	return nil
-}
-
-// invalidateSession clears the cached login flag and drops all cookies so a
-// stale session cookie can't leak into the re-login attempt.
-func (c *Client) invalidateSession() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.loggedIn = false
-	if jar, err := cookiejar.New(nil); err == nil {
-		c.http.Jar = jar
-	}
-}
-
-func (c *Client) login(ctx context.Context) error {
-	if _, _, err := c.fetch(ctx, http.MethodGet, BaseURL+"/", nil, nil); err != nil {
-		return fmt.Errorf("prime: %w", err)
+	if options.Password == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("password"))
 	}
 
-	csrf := c.csrf()
-	if csrf == "" {
-		return errors.New("csrf cookie missing after prime")
+	chromePath := options.ChromePath
+	if chromePath == "" {
+		chromePath = defaultChromePath
 	}
+	profileDirectory := options.ProfileDirectory
 
-	form := url.Values{
-		"__csrf":   {csrf},
-		"username": {c.username},
-		"password": {c.password},
-	}
-	resp, body, err := c.fetch(ctx, http.MethodPost, BaseURL+"/user/login.do",
-		[]byte(form.Encode()),
-		map[string]string{
-			"Content-Type":     "application/x-www-form-urlencoded",
-			"X-Requested-With": "XMLHttpRequest",
-			"Referer":          BaseURL + "/",
-		},
-		fetch_config.WithSkipErrorOnStatus(true),
-	)
-	if err != nil {
-		return fmt.Errorf("login post: %w", err)
-	}
-	if !bytes.Contains(body, []byte(`"result": "success"`)) && !bytes.Contains(body, []byte(`"result":"success"`)) {
-		return fmt.Errorf("login failed (status %d): %s", resp.StatusCode, truncate(string(body), 200))
-	}
-	return nil
-}
-
-// listInfo mirrors the edit-page form fields that feed the PATCH API body.
-type listInfo struct {
-	User        string
-	Slug        string
-	FilmListId  string // numeric, used by /import/list/ and /list/add-films/
-	ListLid     string // short alphanumeric, the target of PATCH /api/v0/list/<lid>
-	Version     int
-	CSRF        string
-	Name        string
-	SharePolicy string // "Public" | "Anyone" | "Friends" | "You"
-	Ranked      bool
-	Description string
-	Tags        []string
-}
-
-func (c *Client) getListInfo(ctx context.Context, user, slug string) (*listInfo, error) {
-	u := fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, user, slug)
-	resp, body, err := c.fetch(ctx, http.MethodGet, u, nil, nil,
-		fetch_config.WithSkipErrorOnStatus(true),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get edit: %w", err)
-	}
-	if resp.StatusCode == http.StatusForbidden {
-		return nil, errSessionExpired
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("get edit: status %d", resp.StatusCode)
-	}
-	return c.parseListInfo(user, slug, body)
-}
-
-func (c *Client) parseListInfo(user, slug string, body []byte) (*listInfo, error) {
-	full := string(body)
-	// The page ships several unrelated forms (sign-in modal, add-film popup,
-	// etc.) whose own __csrf inputs carry the literal "placeholder" until JS
-	// swaps them in. Scope all lookups to the list edit form so we pick the
-	// real values.
-	src := extractFormByID(full, "list-form")
-	if src == "" {
-		src = full
-	}
-	info := &listInfo{
-		User:        user,
-		Slug:        slug,
-		FilmListId:  findInputValue(src, "filmListId"),
-		ListLid:     findInputValue(src, "filmListLid"),
-		CSRF:        findInputValue(src, "__csrf"),
-		Name:        findInputValue(src, "name"),
-		SharePolicy: findSelectedOption(src, "sharing"),
-		Ranked:      hasCheckedAttr(src, "numberedList"),
-		Description: findTextareaValue(src, "notes"),
-	}
-	if v := findInputValue(src, "version"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			info.Version = n
-		}
-	}
-	if t := findInputValue(src, "tags"); t != "" {
-		for _, p := range strings.Split(t, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				info.Tags = append(info.Tags, p)
+	return &Client{
+		username: options.Username,
+		password: options.Password,
+		openSession: func(ctx context.Context) (browserSession, error) {
+			session, err := launchSession(ctx, chromePath, profileDirectory)
+			if err != nil {
+				return nil, err
 			}
-		}
-	}
-	if info.CSRF == "" {
-		info.CSRF = c.csrf()
-	}
-	if info.ListLid == "" {
-		return nil, errors.New("filmListLid not found in edit page")
-	}
-	return info, nil
+			return session, nil
+		},
+	}, nil
 }
 
-var (
-	reImportFilmDataJSON = regexp.MustCompile(`<li class="import-film" data-json="([^"]*)"`)
-	reImportFilmIDNum    = regexp.MustCompile(`<input[^>]*\bname="importFilmId"[^>]*\bvalue="(\d+)"`)
-	reNewFilmLID         = regexp.MustCompile(`<li[^>]*\bclass="[^"]*\bjs-new-film-list-entry\b[^"]*"[^>]*\bdata-film-id="([^"]+)"`)
-)
+// ParseListPath splits "user/slug" into its parts.
+func ParseListPath(listPath string) (string, string, error) {
+	user, slug, found := strings.Cut(strings.Trim(listPath, "/"), "/")
+	if !found || user == "" || slug == "" || strings.Contains(slug, "/") {
+		return "", "", altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: %w: want \"user/slug\"", altshiftErrors.ErrValidationError, ErrBadListPath),
+			listPath,
+		)
+	}
+	return user, slug, nil
+}
 
-// stageFilms walks the /import/list/ → /import/watchlist/match-import-film/
-// → /list/add-films/ pipeline. The final response HTML carries the LIDs of
-// the newly staged films in <li class="js-new-film-list-entry"> nodes.
-func (c *Client) stageFilms(ctx context.Context, info *listInfo, csv []byte) ([]string, error) {
-	// Step 1: upload CSV to /import/list/. The response contains
-	// <li class="import-film" data-json="..."> per row but no numeric IDs.
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("file", "import.csv")
+// UpdateList imports the CSV into the list at "user/slug": signing in first
+// when the browser has no session, and once more when the site turns out not
+// to know the one it has. A dry run stops before the request that commits.
+func (c *Client) UpdateList(ctx context.Context, listPath string, csv []byte, dryRun bool) (*types.UpdateResult, error) {
+	user, slug, err := ParseListPath(listPath)
 	if err != nil {
-		return nil, fmt.Errorf("create form file: %w", err)
+		return nil, err
 	}
-	if _, err := fw.Write(csv); err != nil {
-		return nil, fmt.Errorf("write csv: %w", err)
-	}
-	if err := mw.WriteField("__csrf", info.CSRF); err != nil {
-		return nil, fmt.Errorf("write csrf: %w", err)
-	}
-	if err := mw.WriteField("filmListId", info.FilmListId); err != nil {
-		return nil, fmt.Errorf("write filmListId: %w", err)
-	}
-	if err := mw.Close(); err != nil {
-		return nil, fmt.Errorf("close multipart: %w", err)
+	if c.openSession == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("open session"))
 	}
 
-	_, importBody, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/list/",
-		buf.Bytes(),
-		map[string]string{
-			"Content-Type": mw.FormDataContentType(),
-			"Referer":      fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, info.User, info.Slug),
-		},
-	)
+	// One at a time, and a second is refused rather than kept waiting: its
+	// time would run out while the first runs.
+	if !c.mutex.TryLock() {
+		return nil, altshiftErrors.NewWithTrace(ErrBusy)
+	}
+	defer c.mutex.Unlock()
+
+	session, err := c.openSession(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("post import: %w", err)
+		return nil, fmt.Errorf("open session: %w", err)
+	}
+	if session == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("session"))
+	}
+	defer session.Close(ctx)
+
+	editUrl := editPageUrl(user, slug)
+	if err := session.Open(ctx, editUrl); err != nil {
+		return nil, fmt.Errorf("open edit page: %w", err)
 	}
 
-	dataJSONMatches := reImportFilmDataJSON.FindAllStringSubmatch(string(importBody), -1)
-	if len(dataJSONMatches) == 0 {
-		return nil, errors.New("no import-film nodes in /import/list/ response")
-	}
-	filmObjects := make([]string, 0, len(dataJSONMatches))
-	for _, m := range dataJSONMatches {
-		filmObjects = append(filmObjects, html.UnescapeString(m[1]))
+	signedIn, err := session.SignedIn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("signed in: %w", err)
 	}
 
-	// Step 2: ask /import/watchlist/match-import-film/ to resolve each row
-	// to a Letterboxd numeric film id.
-	matchPayload := fmt.Sprintf(`{"importType":"list","importFilms":[%s]}`, strings.Join(filmObjects, ","))
-	matchForm := url.Values{
-		"json":   {matchPayload},
-		"__csrf": {info.CSRF},
+	signIn := func() error {
+		slog.InfoContext(ctx, "Signing in to Letterboxd.", slog.String("username", c.username))
+		if err := session.SignIn(ctx, c.username, c.password); err != nil {
+			return fmt.Errorf("sign in: %w", err)
+		}
+		if err := session.Open(ctx, editUrl); err != nil {
+			return fmt.Errorf("open edit page: %w", err)
+		}
+		return nil
 	}
-	_, matchBodyBytes, err := c.fetch(ctx, http.MethodPost, BaseURL+"/import/watchlist/match-import-film/",
-		[]byte(matchForm.Encode()),
-		map[string]string{
-			"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+
+	if !signedIn {
+		if err := signIn(); err != nil {
+			return nil, err
+		}
+	}
+
+	result, err := updateList(ctx, session, user, slug, csv, dryRun)
+	// Only the first request, reading the edit page, can find the session
+	// gone, so nothing has been staged and running again is safe.
+	if signedIn && errors.Is(err, ErrNotSignedIn) {
+		slog.InfoContext(ctx, "The Letterboxd session was not recognised.")
+		if err := signIn(); err != nil {
+			return nil, err
+		}
+		result, err = updateList(ctx, session, user, slug, csv, dryRun)
+	}
+	return result, err
+}
+
+func editPageUrl(user string, slug string) string {
+	return fmt.Sprintf("%s/%s/list/%s/edit/", BaseUrl, url.PathEscape(user), url.PathEscape(slug))
+}
+
+// listEditor is the list as the site renders its editor with it, in the
+// data attributes of the element the editor is drawn into.
+type listEditor struct {
+	Lid         string
+	Version     int
+	Name        string
+	Description string
+	Ranked      bool
+	// Sharing is the editor's sharing option: Public, Anyone, Friends or You.
+	Sharing    string
+	Tags       []string
+	ImportPath string
+	// Updates are the changes staged in the editor and not yet saved.
+	Updates []*listUpdate
+}
+
+// listUpdate is one change to a list's entries, as the editor stages it and
+// the API takes it: an ADD of a film by its LID, or an UPDATE or DELETE of the
+// entry at a position.
+type listUpdate struct {
+	Action   string `json:"action"`
+	Listable string `json:"listable,omitzero"`
+	Position *int   `json:"position,omitzero"`
+}
+
+func parseListEditor(page string) (*listEditor, error) {
+	tag := listEditorTag(page)
+	if tag == nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no list editor", ErrUnexpectedPage), excerpt(page))
+	}
+	attributes := tag.Attributes
+
+	editor := &listEditor{
+		Lid:         attributes["data-list-lid"],
+		Name:        attributes["data-list-name"],
+		Description: attributes["data-list-description"],
+		ImportPath:  attributes["data-list-import-url"],
+	}
+	if editor.Lid == "" {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no data-list-lid", ErrUnexpectedPage))
+	}
+	if !strings.HasPrefix(editor.ImportPath, "/") {
+		editor.ImportPath = defaultImportPath
+	}
+
+	version, err := strconv.Atoi(attributes["data-list-version"])
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: data-list-version: %w", ErrUnexpectedPage, err), attributes["data-list-version"])
+	}
+	editor.Version = version
+
+	// As the editor reads it: "true" or "false", and absent or empty is false.
+	switch ranked := attributes["data-list-is-ranked"]; ranked {
+	case "true":
+		editor.Ranked = true
+	case "", "false":
+	default:
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: data-list-is-ranked", ErrUnexpectedPage), ranked)
+	}
+
+	// A public list is the editor's Public whatever its share policy says.
+	editor.Sharing = attributes["data-list-share-policy"]
+	if attributes["data-list-type"] == "public" {
+		editor.Sharing = sharingPublic
+	}
+	if editor.Sharing == "" {
+		editor.Sharing = "You"
+	}
+
+	if tags := attributes["data-list-tags"]; tags != "" {
+		if err := json.Unmarshal([]byte(tags), &editor.Tags); err != nil {
+			return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: data-list-tags: %w", ErrUnexpectedPage, err), tags)
+		}
+	}
+	if updates := attributes["data-initial-list-updates"]; updates != "" {
+		if err := json.Unmarshal([]byte(updates), &editor.Updates); err != nil {
+			return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: data-initial-list-updates: %w", ErrUnexpectedPage, err), updates)
+		}
+	}
+
+	return editor, nil
+}
+
+// publicList and sharePolicy are how the site's forms and its API put the
+// editor's sharing: Public is a published list shared with You.
+func (e *listEditor) publicList() bool {
+	return e.Sharing == sharingPublic
+}
+
+func (e *listEditor) sharePolicy() string {
+	if e.Sharing == sharingPublic {
+		return "You"
+	}
+	return e.Sharing
+}
+
+// lidAlphabet is the base-62 alphabet of LIDs (boxd.it codes).
+const lidAlphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// lidListType is the last decimal digit of a decoded LID that names a list,
+// as 0 names a film and 1 a viewing.
+const lidListType = 2
+
+// decodeListLid returns the numeric id of the list a LID names, as the
+// site's editor computes the filmListId its import form posts.
+func decodeListLid(lid string) (int64, error) {
+	if lid == "" || len(lid) > 10 {
+		return 0, altshiftErrors.NewWithTrace(fmt.Errorf("%w: lid length", ErrUnexpectedPage), lid)
+	}
+
+	var value int64
+	for _, character := range lid {
+		index := strings.IndexRune(lidAlphabet, character)
+		if index < 0 {
+			return 0, altshiftErrors.NewWithTrace(fmt.Errorf("%w: lid character %q", ErrUnexpectedPage, character), lid)
+		}
+		value = value*int64(len(lidAlphabet)) + int64(index)
+	}
+
+	if value%10 != lidListType {
+		return 0, altshiftErrors.NewWithTrace(fmt.Errorf("%w: not a list lid", ErrUnexpectedPage), lid)
+	}
+	return value / 10, nil
+}
+
+// importer is the importer page's matched form: where the rows are matched,
+// where the matched films are staged, and the fields it posts besides them.
+type importer struct {
+	Rows      []string
+	MatchPath string
+	StagePath string
+	Fields    [][2]string
+}
+
+// itemFields are the form's per-row inputs, which the site's importer removes
+// and replaces with one entries field before posting.
+var itemFields = []string{"importProductionId", "importViewingId", "shouldImportProduction", "importReview", "importRating"}
+
+func parseImporter(page string) (*importer, error) {
+	form, contents := extractFormById(page, "importer-matched-form")
+	if form == nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no #importer-matched-form", ErrUnexpectedPage), excerpt(page))
+	}
+
+	parsed := &importer{
+		Rows:      importFilmObjects(contents),
+		MatchPath: form.Attributes["data-url"],
+		StagePath: form.Attributes["action"],
+	}
+	if !strings.HasPrefix(parsed.MatchPath, "/") {
+		parsed.MatchPath = defaultMatchPath
+	}
+	if !strings.HasPrefix(parsed.StagePath, "/") {
+		parsed.StagePath = defaultStagePath
+	}
+
+	for _, input := range startTags(contents, "input") {
+		name := input.Attributes["name"]
+		if name == "" || !strings.EqualFold(input.Attributes["type"], "hidden") || slices.Contains(itemFields, name) {
+			continue
+		}
+		parsed.Fields = append(parsed.Fields, [2]string{name, input.Attributes["value"]})
+	}
+
+	if len(parsed.Rows) == 0 {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no import-film rows", ErrUnexpectedPage), excerpt(contents))
+	}
+	for _, row := range parsed.Rows {
+		if !json.Valid([]byte(row)) {
+			return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: an import-film row that is not json", ErrUnexpectedPage), excerpt(row))
+		}
+	}
+	return parsed, nil
+}
+
+// fetchPage makes the request and returns the page it answered with.
+func fetchPage(ctx context.Context, fetcher pageFetcher, request *FetchRequest) (string, error) {
+	response, err := fetcher.Fetch(ctx, request)
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+	return checkResponse(request, response)
+}
+
+// checkResponse returns the page a request answered with, refusing
+// Cloudflare's answers and the site's errors.
+func checkResponse(request *FetchRequest, response *FetchResponse) (string, error) {
+	if response == nil {
+		return "", altshiftErrors.NewWithTrace(nil_error.New("fetch response"))
+	}
+
+	if response.Mitigated != "" {
+		return "", altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: %s %s: cf-mitigated %s", ErrChallenged, request.Method, request.Url, response.Mitigated),
+		)
+	}
+	if response.Status < 200 || response.Status > 299 {
+		return "", altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: %s %s: %d", ErrUnexpectedStatus, request.Method, request.Url, response.Status),
+			excerpt(response.Body),
+		)
+	}
+	return response.Body, nil
+}
+
+// readEditPage returns the list's edit page, telling a missing session apart
+// from other failures.
+func readEditPage(ctx context.Context, fetcher pageFetcher, user string, slug string) (string, error) {
+	request := &FetchRequest{Method: http.MethodGet, Url: editPageUrl(user, slug), Headers: map[string]string{"Accept": "text/html,*/*;q=0.9"}}
+
+	response, err := fetcher.Fetch(ctx, request)
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+
+	// A visitor without a session is sent to sign in, or refused outright.
+	if response != nil && response.Mitigated == "" &&
+		(strings.Contains(response.Url, "/sign-in") || response.Status == http.StatusUnauthorized || response.Status == http.StatusForbidden) {
+		return "", altshiftErrors.NewWithTrace(fmt.Errorf("%w: %d %s", ErrNotSignedIn, response.Status, response.Url))
+	}
+
+	return checkResponse(request, response)
+}
+
+// updateList walks the site's import as its list editor does (2026-10):
+//
+//  1. GET the list's edit page for the list as the editor is rendered with it.
+//  2. POST the CSV to the editor's import URL, as the editor's import form
+//     does, which answers with the importer page and the rows it read.
+//  3. POST the rows to the match URL, which resolves them to films.
+//  4. POST the films the importer would keep to the matched form's action,
+//     which stages them and redirects to the editor with the staged changes.
+//  5. PATCH /api/v0/list/<lid> with the films the staging adds, which saves.
+//
+// No notes are written: a film already on the list is staged as an UPDATE of
+// its entry, which is left out, so its note stays as it is.
+func updateList(ctx context.Context, fetcher pageFetcher, user string, slug string, csv []byte, dryRun bool) (*types.UpdateResult, error) {
+	if fetcher == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("fetcher"))
+	}
+	listPath := user + "/" + slug
+
+	editPage, err := readEditPage(ctx, fetcher, user, slug)
+	if err != nil {
+		return nil, fmt.Errorf("read edit page: %w", err)
+	}
+	editor, err := parseListEditor(editPage)
+	if err != nil {
+		return nil, fmt.Errorf("parse list editor: %w", err)
+	}
+	csrf := csrfToken(editPage)
+	if csrf == "" {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no csrf token", ErrUnexpectedPage))
+	}
+	filmListId, err := decodeListLid(editor.Lid)
+	if err != nil {
+		return nil, fmt.Errorf("decode list lid: %w", err)
+	}
+
+	importFields := []*FormField{
+		{Name: "filmListId", Value: strconv.FormatInt(filmListId, 10)},
+		{Name: "__csrf", Value: csrf},
+		{Name: "name", Value: editor.Name},
+		{Name: "notes", Value: editor.Description},
+		{Name: "publicList", Value: strconv.FormatBool(editor.publicList())},
+		{Name: "sharePolicy", Value: editor.sharePolicy()},
+		{Name: "numberedList", Value: strconv.FormatBool(editor.Ranked)},
+	}
+	for _, tag := range editor.Tags {
+		importFields = append(importFields, &FormField{Name: "tag", Value: tag})
+	}
+	importFields = append(importFields, &FormField{Name: "file", Value: string(csv), Filename: "import.csv", Type: "text/csv"})
+
+	importPage, err := fetchPage(ctx, fetcher, &FetchRequest{Method: http.MethodPost, Url: BaseUrl + editor.ImportPath, Multipart: importFields})
+	if err != nil {
+		return nil, fmt.Errorf("import: %w", err)
+	}
+	importer, err := parseImporter(importPage)
+	if err != nil {
+		return nil, fmt.Errorf("parse importer: %w", err)
+	}
+
+	// The rows go back as the importer embedded them, in the importer's own
+	// words.
+	matchPayload := `{ importType: "list", importProductions: [ ` + strings.Join(importer.Rows, ", ") + ` ]}`
+	matchPage, err := fetchPage(ctx, fetcher, &FetchRequest{
+		Method: http.MethodPost,
+		Url:    BaseUrl + importer.MatchPath,
+		Headers: map[string]string{
+			headerContentType:  "application/x-www-form-urlencoded; charset=UTF-8",
 			"Accept":           "text/html, */*; q=0.01",
 			"X-Requested-With": "XMLHttpRequest",
-			"Referer":          BaseURL + "/import/list/",
 		},
-	)
+		Body: url.Values{"json": {matchPayload}, "__csrf": {csrf}}.Encode(),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("post match-import-film: %w", err)
+		return nil, fmt.Errorf("match: %w", err)
 	}
 
-	numericMatches := reImportFilmIDNum.FindAllStringSubmatch(string(matchBodyBytes), -1)
-	if len(numericMatches) == 0 {
-		return nil, errors.New("no numeric film ids in match response")
-	}
-	type stagedEntry struct {
-		Film   string `json:"film"`
-		Review string `json:"review"`
-	}
-	entries := make([]stagedEntry, 0, len(numericMatches))
-	for _, m := range numericMatches {
-		entries = append(entries, stagedEntry{Film: m[1]})
-	}
-	entriesJSON, err := json.Marshal(entries)
-	if err != nil {
-		return nil, fmt.Errorf("marshal staged entries: %w", err)
+	productions := matchedProductions(matchPage)
+	if len(productions) == 0 {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no film matched", ErrUnexpectedPage), excerpt(matchPage))
 	}
 
-	// Step 3: POST /list/add-films/ — response embeds LIDs of staged films
-	// (the ones we need to feed to the v0 API patch).
-	stageForm := url.Values{
-		"__csrf":            {info.CSRF},
-		"importListDetails": {"true"},
-		"filmListId":        {info.FilmListId},
-		"name":              {info.Name},
-		"notes":             {info.Description},
-		"publicList":        {""},
-		"sharePolicy":       {""},
-		"numberedList":      {""},
-		"cancelled":         {"false"},
-		"entries":           {string(entriesJSON)},
+	entries := make([]*stagedEntry, 0, len(productions))
+	for _, production := range productions {
+		entries = append(entries, &stagedEntry{Production: production})
 	}
-	_, body, err := c.fetch(ctx, http.MethodPost, BaseURL+"/list/add-films/",
-		[]byte(stageForm.Encode()),
-		map[string]string{
-			"Content-Type": "application/x-www-form-urlencoded",
-			"Referer":      BaseURL + "/import/list/",
+	entriesJson, err := json.Marshal(entries)
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("json marshal: %w", err), entries)
+	}
+
+	stageForm := url.Values{}
+	for _, field := range importer.Fields {
+		stageForm.Add(field[0], field[1])
+	}
+	stageForm.Set("entries", string(entriesJson))
+
+	stagedPage, err := fetchPage(ctx, fetcher, &FetchRequest{
+		Method:  http.MethodPost,
+		Url:     BaseUrl + importer.StagePath,
+		Headers: map[string]string{headerContentType: "application/x-www-form-urlencoded"},
+		Body:    stageForm.Encode(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stage: %w", err)
+	}
+	staged, err := parseListEditor(stagedPage)
+	if err != nil {
+		return nil, fmt.Errorf("parse staged list editor: %w", err)
+	}
+	// Every matched film comes back staged, as an addition or as an update of
+	// the entry already there; none at all is the page having changed, not the
+	// list having every film.
+	if len(staged.Updates) == 0 {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("%w: no staged updates", ErrUnexpectedPage), excerpt(stagedPage))
+	}
+	if stagedCsrf := csrfToken(stagedPage); stagedCsrf != "" {
+		csrf = stagedCsrf
+	}
+
+	var additions []*listUpdate
+	for _, update := range staged.Updates {
+		if update != nil && update.Action == "ADD" && update.Listable != "" {
+			additions = append(additions, &listUpdate{Action: "ADD", Listable: update.Listable})
+		}
+	}
+
+	result := &types.UpdateResult{List: listPath, Matched: len(productions), Added: len(additions), DryRun: dryRun}
+
+	if len(additions) == 0 {
+		slog.InfoContext(ctx, "The Letterboxd list already has every film.", slog.String("list", listPath), slog.Int("matched", len(productions)))
+		return result, nil
+	}
+	if dryRun {
+		lids := make([]string, 0, len(additions))
+		for _, addition := range additions {
+			lids = append(lids, addition.Listable)
+		}
+		slog.InfoContext(
+			ctx,
+			"Dry run: the Letterboxd list was left as it was.",
+			slog.String("list", listPath),
+			slog.Int("matched", len(productions)),
+			slog.Any("lids", lids),
+		)
+		return result, nil
+	}
+
+	payload, err := json.Marshal(newApiListBody(staged, additions))
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("json marshal: %w", err))
+	}
+	saved, err := fetchPage(ctx, fetcher, &FetchRequest{
+		Method: http.MethodPatch,
+		Url:    BaseUrl + "/api/v0/list/" + url.PathEscape(staged.Lid),
+		Headers: map[string]string{
+			headerContentType: "application/json; charset=UTF-8",
+			"X-CSRF-TOKEN":    csrf,
 		},
-	)
+		Body: string(payload),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("post add-films: %w", err)
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	if err := checkSaveMessages(saved); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
 	}
 
-	// Refresh list metadata (version, csrf) — the staging form bumps the
-	// served version exposed in the edit HTML.
-	if refreshed, err := c.parseListInfo(info.User, info.Slug, body); err == nil {
-		info.Version = refreshed.Version
-		info.CSRF = refreshed.CSRF
-		info.ListLid = refreshed.ListLid
-	}
-
-	lidMatches := reNewFilmLID.FindAllStringSubmatch(string(body), -1)
-	lids := make([]string, 0, len(lidMatches))
-	for _, m := range lidMatches {
-		lids = append(lids, m[1])
-	}
-	return lids, nil
+	slog.InfoContext(ctx, "The Letterboxd list was updated.", slog.String("list", listPath), slog.Int("matched", len(productions)), slog.Int("added", len(additions)))
+	return result, nil
 }
 
-type apiListEntry struct {
-	Film             string `json:"film"`
-	Action           string `json:"action"`
-	ContainsSpoilers bool   `json:"containsSpoilers"`
+// stagedEntry is a film for the staging, keyed by production since 2026-07; a
+// review is left out when there is none, as the site does.
+type stagedEntry struct {
+	Production string `json:"production"`
 }
 
 type apiListBody struct {
-	Version     int            `json:"version"`
-	Published   bool           `json:"published"`
-	Name        string         `json:"name"`
-	SharePolicy string         `json:"sharePolicy"`
-	Ranked      bool           `json:"ranked"`
-	Description string         `json:"description"`
-	Tags        []string       `json:"tags"`
-	Entries     []apiListEntry `json:"entries"`
+	Version     int           `json:"version"`
+	Published   bool          `json:"published"`
+	Name        string        `json:"name"`
+	SharePolicy string        `json:"sharePolicy"`
+	Ranked      bool          `json:"ranked"`
+	Description string        `json:"description"`
+	Tags        []string      `json:"tags"`
+	Entries     []*listUpdate `json:"entries"`
 }
 
-func (c *Client) patchList(ctx context.Context, info *listInfo, filmLIDs []string) error {
-	if info.ListLid == "" {
-		return errors.New("patch list: missing list LID")
+// newApiListBody is the save of the list as the editor has it, with the
+// additions, as the editor's own save sends it.
+func newApiListBody(editor *listEditor, additions []*listUpdate) *apiListBody {
+	tags := editor.Tags
+	if tags == nil {
+		tags = []string{}
 	}
-	entries := make([]apiListEntry, 0, len(filmLIDs))
-	for _, lid := range filmLIDs {
-		entries = append(entries, apiListEntry{Film: lid, Action: "ADD"})
+	return &apiListBody{
+		Version:     editor.Version,
+		Published:   editor.publicList(),
+		Name:        editor.Name,
+		SharePolicy: editor.sharePolicy(),
+		Ranked:      editor.Ranked,
+		Description: editor.Description,
+		Tags:        tags,
+		Entries:     additions,
 	}
-
-	body := apiListBody{
-		Version:     info.Version,
-		Published:   info.SharePolicy == "Public",
-		Name:        info.Name,
-		SharePolicy: info.SharePolicy,
-		Ranked:      info.Ranked,
-		Description: info.Description,
-		Tags:        info.Tags,
-		Entries:     entries,
-	}
-	if body.SharePolicy == "" {
-		// The HTML default when no option is selected; API expects "You".
-		body.SharePolicy = "You"
-	}
-	if body.Tags == nil {
-		body.Tags = []string{}
-	}
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshal body: %w", err)
-	}
-
-	resp, _, err := c.fetch(ctx, http.MethodPatch,
-		fmt.Sprintf("%s/api/v0/list/%s", BaseURL, info.ListLid),
-		payload,
-		map[string]string{
-			"Content-Type": "application/json; charset=UTF-8",
-			"X-Csrf-Token": info.CSRF,
-			"Referer":      fmt.Sprintf("%s/%s/list/%s/edit/", BaseURL, info.User, info.Slug),
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("patch: %w", err)
-	}
-	slog.InfoContext(ctx, "PATCH /api/v0/list ok",
-		"status", resp.StatusCode, "lid", info.ListLid, "version", info.Version, "entries", len(entries))
-	return nil
 }
 
-func (c *Client) saveCookies() error {
-	if c.cookiePath == "" {
-		return nil
+// checkSaveMessages refuses a save the API answered with an error message,
+// which it does with a 200.
+func checkSaveMessages(body string) error {
+	var answer struct {
+		Messages []*struct {
+			Type  string `json:"type"`
+			Code  string `json:"code"`
+			Title string `json:"title"`
+		} `json:"messages"`
 	}
-	u, _ := url.Parse(BaseURL)
-	cookies := c.http.Jar.Cookies(u)
-	data, err := json.Marshal(cookies)
-	if err != nil {
-		return fmt.Errorf("marshal cookies: %w", err)
+	if err := json.Unmarshal([]byte(body), &answer); err != nil {
+		return altshiftErrors.NewWithTrace(fmt.Errorf("%w: json unmarshal: %w", ErrUnexpectedPage, err), excerpt(body))
 	}
-	return os.WriteFile(c.cookiePath, data, 0600)
-}
 
-func (c *Client) loadCookies() error {
-	data, err := os.ReadFile(c.cookiePath)
-	if err != nil {
-		return err
-	}
-	var cookies []*http.Cookie
-	if err := json.Unmarshal(data, &cookies); err != nil {
-		return fmt.Errorf("unmarshal cookies: %w", err)
-	}
-	u, _ := url.Parse(BaseURL)
-	c.http.Jar.SetCookies(u, cookies)
-	return nil
-}
-
-func parseListURL(raw string) (user, slug string, err error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", "", err
-	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) < 3 || parts[1] != "list" {
-		return "", "", fmt.Errorf("expected /<user>/list/<slug>, got %q", u.Path)
-	}
-	return parts[0], parts[2], nil
-}
-
-// extractFormByID returns the inner contents of <form id="<id>">...</form>.
-// Empty if not found or the form is unterminated.
-func extractFormByID(src, id string) string {
-	q := regexp.QuoteMeta(id)
-	re := regexp.MustCompile(`(?s)<form\b[^>]*\bid="` + q + `"[^>]*>(.*?)</form>`)
-	if m := re.FindStringSubmatch(src); len(m) > 1 {
-		return m[1]
-	}
-	return ""
-}
-
-// findInputValue locates the `value` of an <input> whose `name` matches the
-// given argument, tolerating either attribute order. The returned value is
-// HTML-unescaped.
-func findInputValue(src, name string) string {
-	q := regexp.QuoteMeta(name)
-	for _, pattern := range []string{
-		`<input\b[^>]*\bname="` + q + `"[^>]*\bvalue="([^"]*)"`,
-		`<input\b[^>]*\bvalue="([^"]*)"[^>]*\bname="` + q + `"\b`,
-	} {
-		re := regexp.MustCompile(pattern)
-		if m := re.FindStringSubmatch(src); len(m) > 1 {
-			return html.UnescapeString(m[1])
+	var problems []string
+	for _, message := range answer.Messages {
+		if message != nil && message.Type == "Error" {
+			problems = append(problems, strings.TrimSpace(message.Code+" "+message.Title))
 		}
 	}
-	return ""
+	if len(problems) > 0 {
+		return altshiftErrors.NewWithTrace(fmt.Errorf("%w: %s", ErrSaveRefused, strings.Join(problems, "; ")))
+	}
+	return nil
 }
 
-// hasCheckedAttr reports whether the named <input> element carries the
-// `checked` attribute.
-func hasCheckedAttr(src, name string) bool {
-	q := regexp.QuoteMeta(name)
-	re := regexp.MustCompile(`<input\b[^>]*\bname="` + q + `"[^>]*\bchecked\b`)
-	return re.MatchString(src)
-}
-
-var reSelectBody = regexp.MustCompile(`(?s)<select\b[^>]*\bname="%s"[^>]*>(.*?)</select>`)
-var reSelectedOption = regexp.MustCompile(`<option\b[^>]*\bvalue="([^"]*)"[^>]*\bselected\b`)
-
-// findSelectedOption returns the `value` of the <option selected> inside
-// the first <select> with the given name. Empty if none selected.
-func findSelectedOption(src, selectName string) string {
-	q := regexp.QuoteMeta(selectName)
-	re := regexp.MustCompile(`(?s)<select\b[^>]*\bname="` + q + `"[^>]*>(.*?)</select>`)
-	m := re.FindStringSubmatch(src)
-	if len(m) < 2 {
-		return ""
+// excerpt is the start of a page, for an error to show what came instead.
+func excerpt(page string) string {
+	page = strings.Join(strings.Fields(page), " ")
+	if len(page) <= maxExcerptBytes {
+		return page
 	}
-	if sm := reSelectedOption.FindStringSubmatch(m[1]); len(sm) > 1 {
-		return html.UnescapeString(sm[1])
-	}
-	return ""
-}
-
-// findTextareaValue returns the textual content of the first <textarea>
-// with the given name (HTML-unescaped).
-func findTextareaValue(src, name string) string {
-	q := regexp.QuoteMeta(name)
-	re := regexp.MustCompile(`(?s)<textarea\b[^>]*\bname="` + q + `"[^>]*>(.*?)</textarea>`)
-	m := re.FindStringSubmatch(src)
-	if len(m) < 2 {
-		return ""
-	}
-	return html.UnescapeString(m[1])
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return page[:maxExcerptBytes] + "…"
 }

@@ -1,7 +1,7 @@
 package endpoint
 
 import (
-	"github.com/Motmedel/utils_go/pkg/http/mux/types/endpoint/initialization_endpoint"
+	"github.com/altshiftab/utils_go/pkg/http/mux/types/endpoint/initialization_endpoint"
 	"github.com/vphpersson/letterboxd_list_updater/api/types/endpoint/update_list_endpoint"
 )
 
